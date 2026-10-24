@@ -1,0 +1,752 @@
+#!/usr/bin/env python3
+"""claude-sync: switch Claude desktop accounts without losing sessions or signing in again.
+
+Unofficial tool, not made by Anthropic. It works with the files the Claude desktop
+app keeps on your Mac, so an app update could change how they're laid out.
+
+What the app keeps per <account>/<org> (and this script merges):
+  - Code tab sessions     claude-code-sessions/<acct>/<org>/local_*.json
+  - Cowork sessions       local-agent-mode-sessions/<acct>/<org>/local_*{.json,/}
+  - Session presets       ccd-session-presets.json  (byAccount)
+  - MCP tool toggles      mcp-user-tool-toggles.json (owners)
+
+What is already shared by every account (nothing to do, reported by `status`):
+  - Transcripts, memory, CLAUDE.md, skills, plans  ~/.claude/...
+    (memory lives in ~/.claude/projects/<folder>/memory, keyed by folder, not account)
+  - Scratch folders stay on disk; synced sessions keep pointing at them.
+
+Not on this machine, so it can't be synced: claude.ai chats, projects, chat memory.
+
+Usage:
+  claude-sync                 status + dry run
+  claude-sync --apply         quit Claude, full sync, relaunch   (alias: switch)
+  claude-sync --apply --no-restart
+  claude-sync --live          safe sync while Claude runs: only writes into the
+                              accounts you're NOT signed into, so they're ready
+                              the moment you switch (no restart needed)
+  claude-sync install         run --live automatically (every 2 min + on account
+                              switch), via a LaunchAgent
+  claude-sync uninstall
+  claude-sync restore [NAME]  list backups, or put one back (quits Claude)
+  Add --no-cowork to skip Cowork sessions.
+
+Accounts (sign in once, then switch without logging in again):
+  claude-sync accounts        list saved accounts
+  claude-sync use <n|name>    quit Claude, save the current sign-in, swap in
+                              that account's, sync sessions, reopen Claude
+  claude-sync add             same, but reopen at the sign-in screen
+  claude-sync rename <n|name> <new name>
+  claude-sync forget <n|name> drop a saved sign-in
+  Sign-ins are kept in ~/.claude-sync/profiles (folder is private to you).
+  Don't use "Log out" inside Claude: that ends the sign-in for good.
+
+Safety: removed files, and files replaced while Claude is closed, are moved to
+~/.claude-sync-backups/<timestamp>/ first (last 30 runs kept). A session you
+delete in one account is removed from the others too, unless a whole folder
+looks wiped (then it's refilled instead).
+"""
+__version__ = "1.0.0"
+import sys
+
+if sys.version_info < (3, 8):
+    sys.exit("claude-sync needs Python 3.8 or newer.")
+
+import json
+import os
+import plistlib
+import shutil
+import subprocess
+import time
+from pathlib import Path
+
+HOME = Path.home()
+APP = Path(os.environ.get("CLAUDE_SYNC_APP_DIR", HOME / "Library/Application Support/Claude"))
+CODE = APP / "claude-code-sessions"
+COWORK = APP / "local-agent-mode-sessions"
+PRESETS = APP / "ccd-session-presets.json"
+TOGGLES = APP / "mcp-user-tool-toggles.json"
+CONFIG = APP / "config.json"
+CLAUDE_HOME = Path(os.environ.get("CLAUDE_CONFIG_DIR") or HOME / ".claude")
+PROJECTS = Path(os.environ.get("CLAUDE_SYNC_PROJECTS", CLAUDE_HOME / "projects"))
+BACKUP_ROOT = Path(os.environ.get("CLAUDE_SYNC_BACKUPS", HOME / ".claude-sync-backups"))
+STATE = BACKUP_ROOT / "state.json"
+LOG = BACKUP_ROOT / "sync.log"
+KEEP_BACKUPS = 30
+LABEL = "com.user.claude-sync"
+AGENT = HOME / "Library/LaunchAgents" / f"{LABEL}.plist"
+LOCK = BACKUP_ROOT / ".lock"
+# Tests: never touch the real app. "1" = act as if Claude is closed, "running" = open.
+NO_APP = os.environ.get("CLAUDE_SYNC_NO_APP")
+
+# Saved sign-ins, one folder per account. Copied as opaque files, never read.
+PROFILES = Path(os.environ.get("CLAUDE_SYNC_PROFILES", HOME / ".claude-sync/profiles"))
+AUTH_PATHS = ["Cookies", "Cookies-journal", "Local Storage", "Session Storage", "IndexedDB", "WebStorage"]
+AUTH_KEYS = ["oauth:tokenCache", "oauth:tokenCacheV2", "lastKnownAccountUuid"]
+
+
+# ---------- helpers ----------
+
+def read_json(path, default=None):
+    try:
+        return json.loads(Path(path).read_text())
+    except Exception:
+        return default
+
+
+def write_json(path, data):
+    tmp = path.with_name(path.name + ".claude-sync-tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    os.replace(tmp, path)
+
+
+def stamp(path: Path) -> float:
+    """When this copy was last changed: the newer of its own timestamps and mtime."""
+    d = read_json(path, {}) or {}
+    t = max(float(d.get("lastActivityAt") or 0), float(d.get("createdAt") or 0)) / 1000
+    try:
+        return max(t, path.stat().st_mtime)
+    except FileNotFoundError:
+        return t
+
+
+def has_transcript(path: Path) -> bool:
+    sid = (read_json(path, {}) or {}).get("cliSessionId")
+    return bool(sid) and any(PROJECTS.glob(f"*/{sid}.jsonl"))
+
+
+def is_uuid(s: str) -> bool:
+    return len(s) == 36 and s.count("-") == 4
+
+
+def org_dirs(root: Path):
+    # <account-uuid>/<org-uuid>; skips siblings like local-agent-mode-sessions/skills-plugin.
+    if not root.is_dir():
+        return []
+    return sorted(p for p in root.glob("*/*")
+                  if p.is_dir() and not p.is_symlink() and is_uuid(p.parent.name) and is_uuid(p.name))
+
+
+def short(d: Path) -> str:
+    return f"{d.parent.name[:8]}/{d.name[:8]}"
+
+
+def claude_pid():
+    # `pgrep -x Claude` misses the app on some setups; match the main binary's path.
+    if NO_APP:
+        return 1 if NO_APP == "running" else None
+    out = subprocess.run(["ps", "-axo", "pid=,comm="], capture_output=True, text=True).stdout
+    for line in out.splitlines():
+        pid, _, comm = line.strip().partition(" ")
+        if comm.endswith(".app/Contents/MacOS/Claude"):
+            return int(pid)
+    return None
+
+
+def claude_running() -> bool:
+    return claude_pid() is not None
+
+
+def quit_claude():
+    if NO_APP:
+        return
+    r = subprocess.run(["osascript", "-e", 'quit app "Claude"'], capture_output=True)
+    if r.returncode and claude_pid():
+        # Apple Events blocked (no Automation permission): ask it to quit via SIGTERM.
+        os.kill(claude_pid(), 15)
+    for _ in range(80):
+        if not claude_running():
+            time.sleep(1)  # let it finish flushing files
+            return
+        time.sleep(0.25)
+    sys.exit("Claude didn't quit (maybe a 'sessions still running' prompt). "
+             "Quit it yourself and try again.")
+
+
+def launch_claude():
+    if not NO_APP:
+        subprocess.run(["open", "-a", "Claude"])
+
+
+class Lock:
+    """Only one claude-sync touches the app's files at a time."""
+
+    def __init__(self, wait=True):
+        self.wait = wait
+
+    def __enter__(self):
+        import fcntl
+        BACKUP_ROOT.mkdir(parents=True, exist_ok=True)
+        self.f = LOCK.open("w")
+        flags = fcntl.LOCK_EX | (0 if self.wait else fcntl.LOCK_NB)
+        try:
+            fcntl.flock(self.f, flags)
+            return True
+        except BlockingIOError:
+            return False
+
+    def __exit__(self, *a):
+        self.f.close()
+
+
+def active_account():
+    return (read_json(CONFIG, {}) or {}).get("lastKnownAccountUuid")
+
+
+class Run:
+    """One sync pass: collects actions, then applies them with backups."""
+
+    def __init__(self, dry, live):
+        self.dry, self.live = dry, live
+        self.active = active_account() if live else None
+        self.backup = BACKUP_ROOT / time.strftime("%Y%m%d-%H%M%S")
+        self.changes = 0
+        self.lines = []
+
+    def writable(self, d: Path) -> bool:
+        # In live mode never touch the signed-in account: the app owns those files.
+        return not (self.live and self.active and d.parent.name == self.active)
+
+    def save_old(self, path: Path):
+        if not (path.exists() or path.is_symlink()):
+            return
+        dst = self.backup / path.relative_to(APP)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(path), str(dst))
+
+    def copy(self, src: Path, dst: Path):
+        self.changes += 1
+        if self.dry:
+            return
+        if self.live:
+            # Replacing a stale copy in a signed-out account: the newer one exists,
+            # so skip the backup (it would crowd out the ones that matter).
+            if dst.exists():
+                dst.unlink()
+        else:
+            self.save_old(dst)
+        shutil.copy2(src, dst)
+
+    def link(self, target: Path, dst: Path):
+        self.changes += 1
+        if not self.dry:
+            os.symlink(target, dst)
+
+    def remove(self, path: Path):
+        self.changes += 1
+        if not self.dry:
+            self.save_old(path)
+
+    def say(self, s):
+        self.lines.append(s)
+
+
+# ---------- session merging (Code + Cowork) ----------
+
+def sync_sessions(run: Run, root: Path, kind: str, state: dict):
+    dirs = org_dirs(root)
+    if len(dirs) < 2:
+        return
+    key = lambda d: str(d.relative_to(APP))
+    now = {key(d): {f.name for f in d.glob("local_*.json")} for d in dirs}
+    seen = state.setdefault("folders", {})
+    # Remembered deletions, so a copy in a folder we couldn't touch yet (signed-in
+    # account during --live) is removed later instead of being spread back.
+    tombs = state.setdefault("deleted", {})
+    for name, t in list(tombs.items()):
+        if time.time() - t > 30 * 86400:
+            del tombs[name]
+
+    # Deletions: present after the last sync, gone now -> deleted in the app.
+    for d in dirs:
+        before = set(seen.get(key(d), []))
+        gone = before - now[key(d)]
+        if gone and (len(gone) > 5 and len(gone) > 0.2 * len(before)):
+            run.say(f"  {kind} {short(d)}: {len(gone)} sessions vanished at once; "
+                    f"treating as a reset and refilling, not deleting elsewhere")
+            continue
+        for name in gone:
+            tombs.setdefault(name, time.time())
+    deleted = set(tombs)
+    new_deletions = sum(1 for d in dirs for n in deleted if (d / n).exists())
+
+    best = {}
+    for d in dirs:
+        for f in d.glob("local_*.json"):
+            if f.name in deleted:
+                continue
+            if f.name not in best or stamp(f) > stamp(best[f.name]):
+                best[f.name] = f
+
+    if kind == "code":
+        # Sessions whose transcript was cleaned up would open empty; don't spread them.
+        best = {n: f for n, f in best.items() if has_transcript(f)}
+
+    per_dir = {}
+    for d in dirs:
+        if not run.writable(d):
+            continue
+        n_add = n_upd = n_del = 0
+        for name in deleted:
+            f = d / name
+            if f.exists():
+                run.remove(f)
+                body = d / name[:-5]
+                if body.is_symlink():  # Cowork data dir we linked earlier
+                    run.remove(body)
+                n_del += 1
+        for name, src in best.items():
+            dst = d / name
+            if src.parent == d:
+                continue
+            if dst.exists():
+                if stamp(dst) >= stamp(src):
+                    continue
+                n_upd += 1
+            else:
+                n_add += 1
+            run.copy(src, dst)
+            if kind == "cowork":
+                # The session's working data (transcript, uploads, outputs) can be
+                # hundreds of MB, so link to the one real copy instead of duplicating.
+                body_src = src.with_suffix("")
+                body_dst = dst.with_suffix("")
+                real = body_src.resolve() if body_src.exists() else None
+                if real and not (body_dst.exists() or body_dst.is_symlink()):
+                    run.link(real, body_dst)
+        per_dir[d] = (n_add, n_upd, n_del)
+
+    run.say(f"{kind}: {len(best)} sessions across {len(dirs)} account/org folders"
+            + (f", {new_deletions} copies of deleted sessions to clear" if new_deletions else ""))
+    for d in dirs:
+        if d in per_dir:
+            a, u, x = per_dir[d]
+            if a or u or x:
+                run.say(f"  {short(d)}: +{a} new, {u} updated" + (f", -{x} removed" if x else ""))
+    skipped = sorted({d.parent.name[:8] for d in dirs if d not in per_dir})
+    if skipped:
+        run.say(f"  {', '.join(skipped)}: signed in, left alone (catches up after you switch)")
+
+    if not run.dry:
+        for d in dirs:
+            seen[key(d)] = sorted(f.name for f in d.glob("local_*.json"))
+
+
+# ---------- app-wide JSON files (only while Claude is closed) ----------
+
+def merge_presets(run: Run):
+    data = read_json(PRESETS)
+    if not data or len(data.get("byAccount", {})) < 2:
+        return
+    accounts = data["byAccount"]
+    union = {}
+    for acct in accounts.values():
+        for p in acct.get("presets", []):
+            cur = union.get(p.get("id"))
+            if not cur or (p.get("lastUsedAt") or 0) > (cur.get("lastUsedAt") or 0):
+                union[p.get("id")] = p
+    changed = 0
+    for acct in accounts.values():
+        have = {p.get("id") for p in acct.get("presets", [])}
+        missing = [p for i, p in union.items() if i not in have]
+        if missing:
+            acct.setdefault("presets", []).extend(missing)
+            changed += len(missing)
+    if changed:
+        run.say(f"presets: +{changed} shared across accounts")
+        run.changes += 1
+        if not run.dry:
+            run.backup.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(PRESETS, run.backup / PRESETS.name)
+            write_json(PRESETS, data)
+
+
+def merge_toggles(run: Run):
+    data = read_json(TOGGLES)
+    if not data or len(data.get("owners", {})) < 2:
+        return
+    owners = data["owners"]
+    union = sorted(set().union(*[set(v) for v in owners.values()]))
+    changed = sum(1 for v in owners.values() if set(v) != set(union))
+    if changed:
+        run.say(f"MCP tool toggles: unified across {len(owners)} accounts")
+        run.changes += 1
+        if not run.dry:
+            run.backup.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(TOGGLES, run.backup / TOGGLES.name)
+            for k in owners:
+                owners[k] = list(union)
+            write_json(TOGGLES, data)
+
+
+# ---------- reporting ----------
+
+def shared_report():
+    mem = [p for p in PROJECTS.glob("*/memory") if any(p.iterdir())] if PROJECTS.is_dir() else []
+    files = sum(1 for p in mem for _ in p.glob("*.md"))
+    print(f"memory: {len(mem)} memory folders ({files} files) in {PROJECTS} "
+          f"-- already shared by every account")
+
+
+def need_app():
+    if not APP.is_dir():
+        sys.exit(f"Claude desktop app data not found at {APP}.\n"
+                 "Install Claude from https://claude.ai/download and sign in once first.")
+
+
+def prune_backups():
+    runs = sorted(p for p in BACKUP_ROOT.glob("2*") if p.is_dir())
+    for old in runs[:-KEEP_BACKUPS]:
+        shutil.rmtree(old, ignore_errors=True)
+
+
+def log(msg):
+    BACKUP_ROOT.mkdir(parents=True, exist_ok=True)
+    with LOG.open("a") as f:
+        f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + msg + "\n")
+    if LOG.stat().st_size > 512_000:
+        LOG.write_text("\n".join(LOG.read_text().splitlines()[-2000:]) + "\n")
+
+
+# ---------- commands ----------
+
+def sync(dry, live, cowork=True, quiet=False):
+    state = read_json(STATE, {}) or {}
+    run = Run(dry=dry, live=live)
+    sync_sessions(run, CODE, "code", state.setdefault("code", {}))
+    if cowork:
+        sync_sessions(run, COWORK, "cowork", state.setdefault("cowork", {}))
+    if not live:
+        merge_presets(run)
+        merge_toggles(run)
+    if not dry:
+        state["lastAccount"] = active_account()
+        state["lastRun"] = time.time()
+        BACKUP_ROOT.mkdir(parents=True, exist_ok=True)
+        write_json(STATE, state)
+        prune_backups()
+    if not quiet:
+        print("\n".join(run.lines))
+    return run
+
+
+def cmd_status(args):
+    need_app()
+    run = sync(dry=True, live=False, cowork="--no-cowork" not in args)
+    if len(org_dirs(CODE)) < 2:
+        print("Only one account folder so far: nothing to sync yet. "
+              "Sign in with another account (`claude-sync add`) and it starts sharing.")
+    shared_report()
+    acct = active_account()
+    print(f"signed in: {acct[:8] if acct else 'unknown'}"
+          f"   auto-sync: {'on' if AGENT.exists() else 'off (claude-sync install)'}")
+    if run.changes:
+        print(f"\n{run.changes} changes pending. Run `claude-sync --apply` (restarts Claude) "
+              f"or `claude-sync --live` (no restart, skips the signed-in account).")
+    else:
+        print("\nEverything is in sync.")
+
+
+def cmd_apply(args):
+    need_app()
+    restart = "--no-restart" not in args
+    with Lock():
+        was_running = claude_running()
+        if was_running:
+            print("Quitting Claude...")
+            quit_claude()
+        run = sync(dry=False, live=False, cowork="--no-cowork" not in args)
+        print(f"Done: {run.changes} changes." + (f" Previous files saved in {run.backup}" if run.backup.exists() else ""))
+        log(f"apply: {run.changes} changes")
+    if was_running and restart:
+        launch_claude()
+        print("Relaunched Claude.")
+
+
+def cmd_live(args):
+    with Lock(wait=False) as got:
+        if not got:
+            return  # a switch or another sync is in progress
+        running = claude_running()
+        # With the app closed nothing is in use, so do the full sync.
+        run = sync(dry=False, live=running, cowork="--no-cowork" not in args,
+                   quiet="--quiet" in args)
+        if run.changes:
+            log(f"{'live' if running else 'full (app closed)'}: {run.changes} changes")
+
+
+# ---------- accounts: sign in once, switch any time ----------
+
+def signed_in(cfg) -> bool:
+    return any(cfg.get(k) for k in ("oauth:tokenCache", "oauth:tokenCacheV2"))
+
+
+def guess_name(acct: str) -> str:
+    # Cowork sessions record the account's email; use it if there is one.
+    for f in (COWORK / acct).glob("*/local_*.json"):
+        email = (read_json(f, {}) or {}).get("emailAddress")
+        if email:
+            return email
+    return f"Account {acct[:8]}"
+
+
+def profiles():
+    if not PROFILES.is_dir():
+        return []
+    # Only folders holding a saved sign-in count (a rename can create a meta-only one).
+    return sorted((p for p in PROFILES.iterdir()
+                   if p.is_dir() and is_uuid(p.name) and (p / "auth.json").exists()),
+                  key=lambda p: (read_json(p / "meta.json", {}) or {}).get("addedAt", 0))
+
+
+def find_profile(prefix: str) -> Path:
+    hits = [p for p in profiles() if p.name.startswith(prefix)]
+    if len(hits) != 1:
+        sys.exit(f"No single saved account matches '{prefix}'. See `claude-sync accounts`.")
+    return hits[0]
+
+
+def remove_path(p: Path):
+    if p.is_dir() and not p.is_symlink():
+        shutil.rmtree(p)
+    elif p.exists() or p.is_symlink():
+        p.unlink()
+
+
+def save_profile() -> str:
+    """Snapshot the signed-in account's login (Claude must be closed). Returns its id."""
+    cfg = read_json(CONFIG, {}) or {}
+    acct = cfg.get("lastKnownAccountUuid")
+    if not acct or not signed_in(cfg):
+        return ""
+    PROFILES.mkdir(parents=True, exist_ok=True)
+    os.chmod(PROFILES.parent, 0o700)
+    dst, tmp, old = PROFILES / acct, PROFILES / f"{acct}.tmp", PROFILES / f"{acct}.old"
+    remove_path(tmp)
+    tmp.mkdir(mode=0o700)
+    for name in AUTH_PATHS:
+        src = APP / name
+        if src.is_dir():
+            shutil.copytree(src, tmp / name, symlinks=True)
+        elif src.exists():
+            shutil.copy2(src, tmp / name)
+    write_json(tmp / "auth.json", {k: cfg[k] for k in AUTH_KEYS if k in cfg})
+    os.chmod(tmp / "auth.json", 0o600)
+    meta = read_json(dst / "meta.json", {}) or {"name": guess_name(acct), "addedAt": time.time()}
+    meta["savedAt"] = time.time()
+    write_json(tmp / "meta.json", meta)
+    remove_path(old)
+    if dst.exists():
+        os.rename(dst, old)
+    os.rename(tmp, dst)
+    remove_path(old)
+    return acct
+
+
+def load_profile(prof):
+    """Make the app start as this account (prof=None: start signed out)."""
+    for name in AUTH_PATHS:
+        remove_path(APP / name)
+        if prof and (prof / name).exists():
+            src = prof / name
+            if src.is_dir():
+                shutil.copytree(src, APP / name, symlinks=True)
+            else:
+                shutil.copy2(src, APP / name)
+    cfg = read_json(CONFIG, {}) or {}
+    keep = {k: v for k, v in cfg.items() if k not in AUTH_KEYS}
+    if prof:
+        keep.update(read_json(prof / "auth.json", {}) or {})
+    write_json(CONFIG, keep)
+
+
+def account_list():
+    cfg = read_json(CONFIG, {}) or {}
+    active = cfg.get("lastKnownAccountUuid") if signed_in(cfg) else None
+    out = []
+    for p in profiles():
+        m = read_json(p / "meta.json", {}) or {}
+        out.append({"id": p.name, "name": m.get("name") or p.name[:8],
+                    "active": p.name == active, "saved": True})
+    if active and not any(a["active"] for a in out):
+        name = (read_json(PROFILES / active / "meta.json", {}) or {}).get("name") or guess_name(active)
+        out.insert(0, {"id": active, "name": name, "active": True, "saved": False})
+    return out
+
+
+def cmd_accounts(args):
+    accts = account_list()
+    if "--json" in args:
+        return print(json.dumps(accts))
+    if not accts:
+        print("No accounts yet. Sign in to Claude, then run `claude-sync add` to add another.")
+    for i, a in enumerate(accts, 1):
+        tag = "  <- signed in" if a["active"] else ""
+        tag += "" if a["saved"] else " (saved on first switch)"
+        print(f"  {i}. {a['name']}  [{a['id'][:8]}]{tag}")
+
+
+def switch_to(prof):
+    """Quit Claude, save the current login, swap in another (or none), sync, relaunch."""
+    need_app()
+    with Lock():
+        if claude_running():
+            quit_claude()
+        saved = save_profile()
+        load_profile(prof)
+        run = sync(dry=False, live=False, quiet=True)
+        log(f"switch {saved[:8] or '-'} -> {prof.name[:8] if prof else 'new sign-in'}: "
+            f"{run.changes} session changes")
+    launch_claude()
+
+
+def resolve(want: str) -> dict:
+    """An account by its number in `accounts`, its name, or the start of its id."""
+    accts = account_list()
+    if want.isdigit() and 0 < int(want) <= len(accts):
+        return accts[int(want) - 1]
+    pick = next((a for a in accts if a["name"].lower() == want.lower()), None)
+    pick = pick or next((a for a in accts if want and a["id"].startswith(want.lower())), None)
+    if not pick:
+        sys.exit(f"No account '{want}'. See `claude-sync accounts`.")
+    return pick
+
+
+def cmd_use(args):
+    if not args:
+        sys.exit("usage: claude-sync use <number|name|id>")
+    pick = resolve(" ".join(args))
+    if pick["active"]:
+        return print(f"Already signed in as {pick['name']}.")
+    switch_to(find_profile(pick["id"]))
+    print(f"Switched to {pick['name']}.")
+
+
+def cmd_add(args):
+    switch_to(None)
+    print("Claude is open at the sign-in screen. Sign in with the other account; "
+          "it's saved automatically the next time you switch.")
+
+
+def cmd_rename(args):
+    if len(args) < 2:
+        sys.exit("usage: claude-sync rename <number|name|id> <new name>")
+    acct = resolve(args[0])
+    p = PROFILES / acct["id"]
+    if not p.is_dir():
+        # Signed in but never saved yet: keep the name for when it is.
+        p.mkdir(parents=True, mode=0o700)
+    meta = read_json(p / "meta.json", {}) or {"addedAt": time.time()}
+    meta["name"] = " ".join(args[1:])
+    write_json(p / "meta.json", meta)
+
+
+def cmd_forget(args):
+    if not args:
+        sys.exit("usage: claude-sync forget <number|name|id>")
+    p = find_profile(resolve(" ".join(args))["id"])
+    remove_path(p)
+    print("Removed the saved sign-in. (Its sessions stay.)")
+
+
+def pick_python() -> str:
+    """A python3 that works without prompting. /usr/bin/python3 is only a stub that
+    asks to install developer tools on Macs without them, so check for those first."""
+    clt = subprocess.run(["xcode-select", "-p"], capture_output=True).returncode == 0
+    if clt and Path("/usr/bin/python3").exists():
+        return "/usr/bin/python3"
+    found = shutil.which("python3")
+    return found if found and found != "/usr/bin/python3" else sys.executable
+
+
+def cmd_install(args):
+    exe = Path(os.path.realpath(sys.argv[0]))
+    python = pick_python()
+    AGENT.parent.mkdir(parents=True, exist_ok=True)
+    plist = {
+        "Label": LABEL,
+        "ProgramArguments": [python, str(exe), "--live", "--quiet"],
+        "StartInterval": 120,
+        "WatchPaths": [str(CONFIG)],  # fires when you switch accounts
+        "ThrottleInterval": 15,
+        "RunAtLoad": True,
+        "StandardErrorPath": str(BACKUP_ROOT / "agent.err"),
+        "StandardOutPath": "/dev/null",
+    }
+    BACKUP_ROOT.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{LABEL}"], capture_output=True)
+    AGENT.write_bytes(plistlib.dumps(plist))
+    r = subprocess.run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(AGENT)],
+                       capture_output=True, text=True)
+    if r.returncode:
+        sys.exit(f"launchctl failed: {r.stderr.strip()}")
+    print(f"Auto-sync on: every 2 min and whenever you switch accounts.\nLog: {LOG}")
+
+
+def cmd_uninstall(args):
+    subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{LABEL}"], capture_output=True)
+    if AGENT.exists():
+        AGENT.unlink()
+    print("Auto-sync off.")
+
+
+def cmd_restore(args):
+    runs = sorted(p for p in BACKUP_ROOT.glob("2*") if p.is_dir())
+    name = next((a for a in args if not a.startswith("-")), None)
+    if not name:
+        if not runs:
+            print("No backups.")
+        for r in runs[-15:]:
+            n = sum(1 for p in r.rglob("*") if p.is_file() or p.is_symlink())
+            print(f"  {r.name}  ({n} files)")
+        print("\nclaude-sync restore <NAME> puts those files back.")
+        return
+    src = BACKUP_ROOT / name
+    if not src.is_dir():
+        sys.exit(f"No backup named {name}")
+    if claude_running():
+        quit_claude()
+    n = 0
+    for p in sorted(src.rglob("*")):
+        if p.is_dir() and not p.is_symlink():
+            continue
+        rel = p.relative_to(src)
+        # Old-style backups (v1) were a full copy of claude-code-sessions/.
+        dst = APP / rel if rel.parts[0] in (CODE.name, COWORK.name, PRESETS.name, TOGGLES.name) else CODE / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if dst.exists() or dst.is_symlink():
+            if dst.is_dir() and not dst.is_symlink():
+                continue
+            dst.unlink()
+        if p.is_symlink():
+            os.symlink(os.readlink(p), dst)
+        else:
+            shutil.copy2(p, dst)
+        n += 1
+    # Restored sessions must not be treated as "deleted" on the next run.
+    st = read_json(STATE, {}) or {}
+    st.pop("code", None), st.pop("cowork", None)
+    BACKUP_ROOT.mkdir(parents=True, exist_ok=True)
+    write_json(STATE, st)
+    print(f"Restored {n} files from {name}. Reopen Claude.")
+
+
+def main():
+    args = sys.argv[1:]
+    cmds = {"install": cmd_install, "uninstall": cmd_uninstall, "restore": cmd_restore,
+            "switch": cmd_apply, "status": cmd_status, "accounts": cmd_accounts,
+            "use": cmd_use, "add": cmd_add, "rename": cmd_rename, "forget": cmd_forget}
+    if args and args[0] in cmds:
+        return cmds[args[0]](args[1:])
+    if "-h" in args or "--help" in args:
+        return print(__doc__)
+    if "--version" in args or "-V" in args:
+        return print(f"claude-sync {__version__}")
+    if "--apply" in args:
+        return cmd_apply(args)
+    if "--live" in args:
+        return cmd_live(args)
+    return cmd_status(args)
+
+
+if __name__ == "__main__":
+    main()

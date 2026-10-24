@@ -1,0 +1,26 @@
+name: test
+on: [push, pull_request]
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest]
+        python: [system, "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        if: matrix.python != 'system'
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Tests
+        run: |
+          if [ "${{ matrix.python }}" = system ]; then PY=/usr/bin/python3; else PY=python3; fi
+          tests/run.sh "$PY"
+      - name: Installer on a fresh home folder
+        run: |
+          H=$(mktemp -d)
+          HOME="$H" bash install.sh
+          HOME="$H" "$H/.local/bin/claude-sync" --version
+          ! HOME="$H" "$H/.local/bin/claude-sync"   # no Claude app: clear error, exit 1
