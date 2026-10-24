@@ -33,7 +33,8 @@ SRC="${BASH_SOURCE[0]:-}"
 if [ -n "$SRC" ] && [ -f "$SRC" ] && [ -f "$(dirname "$SRC")/claude-sync" ]; then
   cp "$(dirname "$SRC")/claude-sync" "$TMP"
 else
-  curl -fsSL "$RAW/claude-sync" -o "$TMP" || fail "download failed"
+  curl -fsSL --retry 3 --connect-timeout 15 --max-time 120 "$RAW/claude-sync" -o "$TMP" \
+    || fail "download failed (network?). Try again in a moment."
 fi
 
 # Pin the shebang to the python we checked, so it never hits the stub.
