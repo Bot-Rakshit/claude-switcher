@@ -21,7 +21,7 @@ ok_python() {
   "$1" -c 'import sys; sys.exit(sys.version_info < (3, 8))' >/dev/null 2>&1
 }
 PY=""
-for c in "$(command -v python3 || true)" /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
+for c in /usr/bin/python3 "$(command -v python3 || true)" /opt/homebrew/bin/python3 /usr/local/bin/python3; do
   if [ -n "$c" ] && ok_python "$c"; then PY="$c"; break; fi
 done
 [ -n "$PY" ] || fail "needs Python 3.8+. Run \`xcode-select --install\` (or \`brew install python\`), then re-run this."
